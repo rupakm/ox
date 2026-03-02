@@ -608,6 +608,9 @@ func TestCheckCodexIntegration_ProjectDetected(t *testing.T) {
 	if !strings.Contains(result.message, "no hooks needed") {
 		t.Errorf("expected message to mention no hooks needed, got: %s", result.message)
 	}
+	if !strings.Contains(result.message, "ox agent <id> session start") {
+		t.Errorf("expected message to mention manual session start, got: %s", result.message)
+	}
 }
 
 func TestCheckCodexIntegration_NotDetected(t *testing.T) {
@@ -624,6 +627,9 @@ func TestCheckCodexIntegration_NotDetected(t *testing.T) {
 	}
 	if !strings.Contains(result.detail, "AGENTS.md") {
 		t.Errorf("expected detail to mention AGENTS.md, got: %s", result.detail)
+	}
+	if !strings.Contains(result.detail, "ox agent prime") {
+		t.Errorf("expected detail to mention manual prime flow, got: %s", result.detail)
 	}
 }
 
@@ -797,6 +803,7 @@ func TestCheckUserLevelIntegration_Enabled(t *testing.T) {
 	oldHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpHome)
 	defer os.Setenv("HOME", oldHome)
+	t.Setenv("AGENT_ENV", "claude-code")
 
 	claudeDir := filepath.Join(tmpHome, ".claude")
 	if err := os.MkdirAll(claudeDir, 0755); err != nil {
@@ -830,6 +837,7 @@ func TestCheckUserLevelIntegration_NotEnabled(t *testing.T) {
 	oldHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpHome)
 	defer os.Setenv("HOME", oldHome)
+	t.Setenv("AGENT_ENV", "claude-code")
 
 	result := checkUserLevelIntegration()
 
@@ -1628,6 +1636,7 @@ func TestCheckUserLevelIntegration_WithCanonicalFormat(t *testing.T) {
 	oldHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpHome)
 	defer os.Setenv("HOME", oldHome)
+	t.Setenv("AGENT_ENV", "claude-code")
 
 	claudeDir := filepath.Join(tmpHome, ".claude")
 	if err := os.MkdirAll(claudeDir, 0755); err != nil {
@@ -1652,6 +1661,7 @@ func TestCheckUserLevelIntegration_EmptyCLAUDEMd(t *testing.T) {
 	oldHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpHome)
 	defer os.Setenv("HOME", oldHome)
+	t.Setenv("AGENT_ENV", "claude-code")
 
 	claudeDir := filepath.Join(tmpHome, ".claude")
 	if err := os.MkdirAll(claudeDir, 0755); err != nil {
@@ -1676,6 +1686,7 @@ func TestCheckUserLevelIntegration_ClaudeDirNoFile(t *testing.T) {
 	oldHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpHome)
 	defer os.Setenv("HOME", oldHome)
+	t.Setenv("AGENT_ENV", "claude-code")
 
 	// create .claude directory but no CLAUDE.md
 	claudeDir := filepath.Join(tmpHome, ".claude")

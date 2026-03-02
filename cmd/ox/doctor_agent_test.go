@@ -22,7 +22,9 @@ var agentEnvVarsToSave = []string{
 	"AIDER",
 	"AIDER_AGENT",
 	"AIDER_SESSION",
-	"CODEX_ENV",
+	"CODEX_CI",
+	"CODEX_SANDBOX",
+	"CODEX_THREAD_ID",
 	"OPENCODE",
 	"OPENCODE_AGENT",
 	"CODE_PUPPY",
@@ -97,6 +99,7 @@ func TestCheckAgentEnvValidity(t *testing.T) {
 
 		result := checkAgentEnvValidity()
 		assert.True(t, result.passed, "expected passed for valid AGENT_ENV=claude-code")
+		assert.Contains(t, result.message, "canonical: claude")
 	})
 
 	t.Run("valid agent case insensitive", func(t *testing.T) {
@@ -104,6 +107,22 @@ func TestCheckAgentEnvValidity(t *testing.T) {
 
 		result := checkAgentEnvValidity()
 		assert.True(t, result.passed, "expected passed for valid AGENT_ENV=Claude-Code (case insensitive)")
+	})
+
+	t.Run("valid canonical agent slug", func(t *testing.T) {
+		os.Setenv("AGENT_ENV", "claude")
+
+		result := checkAgentEnvValidity()
+		assert.True(t, result.passed, "expected passed for valid AGENT_ENV=claude")
+		assert.Contains(t, result.message, "canonical: claude")
+	})
+
+	t.Run("valid canonical code puppy slug", func(t *testing.T) {
+		os.Setenv("AGENT_ENV", "code-puppy")
+
+		result := checkAgentEnvValidity()
+		assert.True(t, result.passed, "expected passed for valid AGENT_ENV=code-puppy")
+		assert.Contains(t, result.message, "canonical: code-puppy")
 	})
 
 	t.Run("unknown agent", func(t *testing.T) {
@@ -116,7 +135,14 @@ func TestCheckAgentEnvValidity(t *testing.T) {
 
 func TestCheckConflictingAgentEnvVars(t *testing.T) {
 	// save all relevant env vars
-	envVars := []string{"CLAUDE_CODE", "CURSOR_TRACE_ID", "WINDSURF_SESSION", "CLINE_TASK_ID", "AIDER_SESSION", "CODEX_ENV"}
+	envVars := []string{
+		"CLAUDE_CODE", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+		"CURSOR_TRACE_ID",
+		"WINDSURF_SESSION",
+		"CLINE_TASK_ID",
+		"AIDER_SESSION",
+		"CODEX_CI", "CODEX_SANDBOX", "CODEX_THREAD_ID",
+	}
 	saved := make(map[string]string)
 	for _, v := range envVars {
 		saved[v] = os.Getenv(v)
@@ -159,6 +185,17 @@ func TestCheckConflictingAgentEnvVars(t *testing.T) {
 
 		os.Unsetenv("CLAUDE_CODE")
 		os.Unsetenv("CURSOR_TRACE_ID")
+	})
+
+	t.Run("multiple Codex vars only - no conflict", func(t *testing.T) {
+		os.Setenv("CODEX_CI", "1")
+		os.Setenv("CODEX_THREAD_ID", "thread_123")
+
+		result := checkConflictingAgentEnvVars()
+		assert.True(t, result.passed, "expected passed for multiple env vars from same agent")
+
+		os.Unsetenv("CODEX_CI")
+		os.Unsetenv("CODEX_THREAD_ID")
 	})
 }
 

@@ -51,18 +51,32 @@ func checkAgentEnvValidity() checkResult {
 			"Set AGENT_ENV to override agent detection")
 	}
 
-	// check if it matches a known agent type
-	knownAgents := []string{
-		"claude-code", "cursor", "windsurf", "cline", "aider",
-		"codex", "opencode", "gemini", "codepuppy", "droid",
+	// Normalize aliases to canonical slugs so doctor output matches agentx
+	// AgentType constants. Keep legacy aliases accepted for compatibility.
+	aliases := map[string]string{
+		"claude-code": "claude",
+		"claudecode":  "claude",
+		"claude":      "claude",
+		"cursor":      "cursor",
+		"windsurf":    "windsurf",
+		"cline":       "cline",
+		"aider":       "aider",
+		"codex":       "codex",
+		"opencode":    "opencode",
+		"gemini":      "gemini",
+		"codepuppy":   "code-puppy",
+		"code-puppy":  "code-puppy",
+		"droid":       "droid",
+	}
+	agentEnvLower := strings.ToLower(agentEnv)
+	if canonical, ok := aliases[agentEnvLower]; ok {
+		return PassedCheck("AGENT_ENV",
+			fmt.Sprintf("Valid: %s (canonical: %s)", agentEnv, canonical))
 	}
 
-	agentEnvLower := strings.ToLower(agentEnv)
-	for _, known := range knownAgents {
-		if agentEnvLower == known {
-			return PassedCheck("AGENT_ENV",
-				fmt.Sprintf("Valid: %s", agentEnv))
-		}
+	knownAgents := []string{
+		"claude", "cursor", "windsurf", "cline", "aider",
+		"codex", "opencode", "gemini", "code-puppy", "droid",
 	}
 
 	return WarningCheck("AGENT_ENV",
@@ -72,20 +86,24 @@ func checkAgentEnvValidity() checkResult {
 
 // checkConflictingAgentEnvVars checks for multiple agent env vars that might conflict
 func checkConflictingAgentEnvVars() checkResult {
-	// env vars that indicate specific agent contexts
-	agentEnvVars := map[string]string{
-		"CLAUDE_CODE":      "Claude Code",
-		"CURSOR_TRACE_ID":  "Cursor",
-		"WINDSURF_SESSION": "Windsurf",
-		"CLINE_TASK_ID":    "Cline",
-		"AIDER_SESSION":    "Aider",
-		"CODEX_ENV":        "Codex",
+	// env var signals grouped by agent so multiple vars from one agent don't
+	// look like cross-agent conflicts.
+	agentSignals := map[string][]string{
+		"Claude Code": {"CLAUDE_CODE", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"},
+		"Cursor":      {"CURSOR_TRACE_ID"},
+		"Windsurf":    {"WINDSURF_SESSION"},
+		"Cline":       {"CLINE_TASK_ID"},
+		"Aider":       {"AIDER_SESSION"},
+		"Codex":       {"CODEX_CI", "CODEX_SANDBOX", "CODEX_THREAD_ID"},
 	}
 
 	var detected []string
-	for envVar, agentName := range agentEnvVars {
-		if os.Getenv(envVar) != "" {
-			detected = append(detected, agentName)
+	for agentName, signals := range agentSignals {
+		for _, envVar := range signals {
+			if os.Getenv(envVar) != "" {
+				detected = append(detected, agentName)
+				break
+			}
 		}
 	}
 
