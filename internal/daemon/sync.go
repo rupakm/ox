@@ -265,6 +265,9 @@ type SyncScheduler struct {
 	cloneSem      chan struct{} // semaphore limiting concurrent clones
 	cloneInFlight sync.Map      // tracks workspace IDs with clone in progress (dedup)
 
+	// per-workspace locks for sync state file updates (load-mutate-save)
+	syncStateLocks sync.Map // map[string]*sync.Mutex
+
 	// test hooks (nil in production)
 	onBeforeCloneSem func() // called just before acquiring cloneSem; tests use this to observe blocking
 
@@ -790,6 +793,7 @@ func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, fo
 		if err := s.workspaceRegistry.UpdateConfigLastSync("ledger"); err != nil {
 			s.logger.Warn("failed to update ledger config last sync", "error", err)
 		}
+		s.recordSyncState(ctx, s.config.LedgerPath)
 
 		if progress != nil {
 			_ = progress.WriteStage("skipped", "Remote unchanged, skipping pull")
@@ -807,6 +811,7 @@ func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, fo
 			if err := s.workspaceRegistry.UpdateConfigLastSync("ledger"); err != nil {
 				s.logger.Warn("failed to update ledger config last sync", "error", err)
 			}
+			s.recordSyncState(ctx, s.config.LedgerPath)
 			if progress != nil {
 				_ = progress.WriteStage("skipped", "Recently fetched, skipping pull")
 			}
@@ -838,6 +843,7 @@ func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, fo
 		}
 		s.metrics.RecordPullFailure()
 		s.workspaceRegistry.RecordSyncFailure("ledger")
+		s.recordSyncStateFailure(s.config.LedgerPath)
 		if detail != "" {
 			return fmt.Errorf("ledger fetch failed: %s (%w)", detail, err)
 		}
@@ -883,6 +889,7 @@ func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, fo
 		}
 		s.metrics.RecordPullFailure()
 		s.workspaceRegistry.RecordSyncFailure("ledger")
+		s.recordSyncStateFailure(s.config.LedgerPath)
 
 		// check if it's a merge conflict
 		statusCmd := exec.CommandContext(ctx, "git", "-C", s.config.LedgerPath, "status", "--porcelain")
@@ -926,6 +933,7 @@ func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, fo
 	if err := s.workspaceRegistry.UpdateConfigLastSync("ledger"); err != nil {
 		s.logger.Warn("failed to update ledger config last sync", "error", err)
 	}
+	s.recordSyncState(ctx, s.config.LedgerPath)
 
 	s.logger.Debug("pull complete", "duration", duration)
 	return nil
@@ -1729,6 +1737,7 @@ func (s *SyncScheduler) doTeamSync(ctx context.Context, progress *ProgressWriter
 		if pullErr != nil {
 			s.workspaceRegistry.SetWorkspaceError(ws.ID, pullErr.Error())
 			s.workspaceRegistry.RecordSyncFailure(ws.ID)
+			s.recordSyncStateFailure(ws.Path)
 			s.logger.Debug("team context pull failed", "team", ws.TeamName, "error", pullErr)
 			s.metrics.RecordTeamSyncError()
 			if progress != nil {
@@ -1751,6 +1760,7 @@ func (s *SyncScheduler) doTeamSync(ctx context.Context, progress *ProgressWriter
 			if err := s.workspaceRegistry.UpdateConfigLastSync(ws.ID); err != nil {
 				s.logger.Warn("failed to update config last sync", "team", ws.TeamName, "error", err)
 			}
+			s.recordSyncState(ctx, ws.Path)
 			syncedCount++
 
 			duration := time.Since(startTime)
@@ -1940,6 +1950,7 @@ func (s *SyncScheduler) cloneInBackground(cloneURL, repoPath, repoType, workspac
 			if err := s.workspaceRegistry.UpdateConfigLastSync(workspaceID); err != nil {
 				s.logger.Warn("failed to backfill config last sync", "type", repoType, "error", err)
 			}
+			s.recordSyncState(context.Background(), repoPath)
 		}
 	} else if result.Cloned {
 		s.logger.Info("background clone complete", "type", repoType, "path", repoPath)
@@ -1953,6 +1964,7 @@ func (s *SyncScheduler) cloneInBackground(cloneURL, repoPath, repoType, workspac
 		if err := s.workspaceRegistry.UpdateConfigLastSync(workspaceID); err != nil {
 			s.logger.Warn("failed to update config last sync after clone", "type", repoType, "error", err)
 		}
+		s.recordSyncState(context.Background(), repoPath)
 	}
 
 	// update exists flags so status renders correctly before next Reload()
@@ -2366,4 +2378,54 @@ func injectGitCredentials(gitURL, username, password string) string {
 
 	// don't inject credentials into other http:// URLs (security risk)
 	return gitURL
+}
+
+// syncStateLock returns a per-workspace mutex for serializing sync state updates.
+func (s *SyncScheduler) syncStateLock(path string) *sync.Mutex {
+	actual, _ := s.syncStateLocks.LoadOrStore(path, &sync.Mutex{})
+	return actual.(*sync.Mutex)
+}
+
+// recordSyncState captures git HEAD SHA and persists sync state for a workspace.
+// Called after successful pull/clone operations. Failures are logged but not propagated
+// since sync state is best-effort observability.
+func (s *SyncScheduler) recordSyncState(ctx context.Context, workspacePath string) {
+	lock := s.syncStateLock(workspacePath)
+	lock.Lock()
+	defer lock.Unlock()
+
+	sha, err := gitHeadSHA(ctx, workspacePath)
+	if err != nil {
+		s.logger.Debug("failed to get HEAD SHA for sync state", "path", workspacePath, "error", err)
+		sha = ""
+	}
+
+	state := LoadSyncState(workspacePath)
+	state.RecordSuccess(sha)
+	if err := SaveSyncState(workspacePath, state); err != nil {
+		s.logger.Warn("failed to save sync state", "path", workspacePath, "error", err)
+	}
+}
+
+// recordSyncStateFailure increments the failure counter in sync state.
+func (s *SyncScheduler) recordSyncStateFailure(workspacePath string) {
+	lock := s.syncStateLock(workspacePath)
+	lock.Lock()
+	defer lock.Unlock()
+
+	state := LoadSyncState(workspacePath)
+	state.RecordFailure()
+	if err := SaveSyncState(workspacePath, state); err != nil {
+		s.logger.Debug("failed to save sync state failure", "path", workspacePath, "error", err)
+	}
+}
+
+// gitHeadSHA returns the current HEAD commit SHA for the repo at the given path.
+func gitHeadSHA(ctx context.Context, repoPath string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
