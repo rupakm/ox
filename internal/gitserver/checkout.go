@@ -38,6 +38,15 @@ type CheckoutOptions struct {
 
 	// SingleBranch clones only the specified branch (or default branch if Branch is empty)
 	SingleBranch bool
+
+	// PartialClone enables --filter=blob:none (treeless clone, blobs fetched on demand)
+	PartialClone bool
+
+	// Sparse enables --sparse (sparse checkout mode)
+	Sparse bool
+
+	// NoCheckout enables --no-checkout (skip working tree creation after clone)
+	NoCheckout bool
 }
 
 // DefaultCheckoutPath returns the default checkout path for a repo.
@@ -114,7 +123,7 @@ func cloneRepo(ctx context.Context, repoURL, path string, creds *GitCredentials,
 	}
 
 	// build authenticated URL
-	authURL, err := buildAuthURL(repoURL, creds)
+	authURL, err := BuildAuthURL(repoURL, creds)
 	if err != nil {
 		return fmt.Errorf("failed to build authenticated URL: %w", err)
 	}
@@ -123,8 +132,17 @@ func cloneRepo(ctx context.Context, repoURL, path string, creds *GitCredentials,
 	args := []string{"clone"}
 
 	if opts != nil {
+		if opts.PartialClone {
+			args = append(args, "--filter=blob:none")
+		}
 		if opts.Depth > 0 {
 			args = append(args, "--depth", fmt.Sprintf("%d", opts.Depth))
+		}
+		if opts.Sparse {
+			args = append(args, "--sparse")
+		}
+		if opts.NoCheckout {
+			args = append(args, "--no-checkout")
 		}
 		if opts.SingleBranch {
 			args = append(args, "--single-branch")
@@ -208,11 +226,11 @@ func isSSHURL(repoURL string) bool {
 	return strings.Contains(repoURL, "@") && !strings.Contains(repoURL, "://")
 }
 
-// buildAuthURL embeds credentials into the git URL for authentication.
+// BuildAuthURL embeds credentials into the git URL for authentication.
 // Uses the PAT token with oauth2 username for GitLab-style auth.
 // SSH URLs are returned unchanged since they use SSH key auth.
 // Supports https:// URLs and http://localhost URLs (for local development).
-func buildAuthURL(repoURL string, creds *GitCredentials) (string, error) {
+func BuildAuthURL(repoURL string, creds *GitCredentials) (string, error) {
 	if creds == nil || creds.Token == "" {
 		return repoURL, nil
 	}

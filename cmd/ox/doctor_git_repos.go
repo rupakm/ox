@@ -1373,7 +1373,7 @@ func fixMissingRepos(gitRoot string, localCfg *config.LocalConfig) checkResult {
 			continue
 		}
 
-		if err := cloneViaDaemon(tc.cloneURL, tcPath, "team_context", projectEndpoint); err != nil {
+		if err := cloneViaDaemon(tc.cloneURL, tcPath, "team-context", projectEndpoint); err != nil {
 			fmt.Printf("    Clone failed: %v\n", err)
 			skipped++
 			continue
@@ -1492,24 +1492,35 @@ func cloneViaDaemon(cloneURL, targetPath, repoType, endpointURL string) error {
 	// ─────────────────────────────────────────────────────────────────────────
 	// This is a CRITICAL PATH EXCEPTION. Clone is required for product to
 	// function at all. See function-level comment for rationale.
-	//
-	// Uses gitserver.CloneFromURLWithEndpoint which:
-	// - Loads credentials from local credential store
-	// - Builds authenticated URL with oauth2:TOKEN format
-	// - Executes git clone directly
 	// ─────────────────────────────────────────────────────────────────────────
 	fmt.Println("    Note: Daemon not running, using direct clone")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// team contexts only need main branch
-	var cloneOpts *gitserver.CheckoutOptions
-	if repoType == "team_context" {
-		cloneOpts = &gitserver.CheckoutOptions{Branch: "main", SingleBranch: true}
-	}
-	if err := gitserver.CloneFromURLWithEndpoint(ctx, cloneURL, targetPath, endpointURL, cloneOpts); err != nil {
-		return fmt.Errorf("direct clone failed: %w", err)
+	if repoType == "team-context" {
+		// team contexts use shared two-phase partial clone (same code as daemon)
+		creds, err := gitserver.LoadCredentialsForEndpoint(endpointURL)
+		if err != nil {
+			return fmt.Errorf("load credentials: %w", err)
+		}
+		if creds == nil {
+			return fmt.Errorf("direct clone failed: %w", gitserver.ErrNoCredentials)
+		}
+		authURL, err := gitserver.BuildAuthURL(cloneURL, creds)
+		if err != nil {
+			return fmt.Errorf("build auth URL: %w", err)
+		}
+		result, err := gitserver.TwoPhaseClone(ctx, authURL, targetPath)
+		if err != nil {
+			return fmt.Errorf("direct clone failed: %w", err)
+		}
+		gitserver.ValidateTeamContextClone(targetPath, result.ManifestConfig)
+	} else {
+		// ledger: full clone
+		if err := gitserver.CloneFromURLWithEndpoint(ctx, cloneURL, targetPath, endpointURL, nil); err != nil {
+			return fmt.Errorf("direct clone failed: %w", err)
+		}
 	}
 
 	fmt.Println("    Cloned successfully (direct).")
@@ -2508,4 +2519,44 @@ func isRecentlyInitialized(gitRoot string) bool {
 		return false
 	}
 	return time.Since(info.ModTime()) < bootstrapGracePeriod
+}
+
+// checkTeamContextCloneStrategy detects team context clones that are full clones
+// (not partial). Partial clones use --filter=blob:none which sets
+// extensions.partialClone in the git config. Full clones download all blobs upfront
+// and waste disk/bandwidth. This is informational only — blue-green reclone will
+// eventually replace full clones with partial ones.
+func checkTeamContextCloneStrategy() []checkResult {
+	var results []checkResult
+
+	gitRoot := findGitRoot()
+	if gitRoot == "" {
+		return results
+	}
+
+	localCfg, err := config.LoadLocalConfig(gitRoot)
+	if err != nil || localCfg == nil {
+		return results
+	}
+
+	for _, tc := range localCfg.TeamContexts {
+		if tc.Path == "" || !isGitRepo(tc.Path) {
+			continue
+		}
+
+		cmd := exec.Command("git", "-C", tc.Path, "config", "--get", "extensions.partialClone")
+		output, err := cmd.Output()
+
+		name := fmt.Sprintf("Team %s clone strategy", tc.TeamName)
+
+		if err != nil || strings.TrimSpace(string(output)) == "" {
+			results = append(results, InfoCheck(name,
+				"full clone (not partial)",
+				"Will be upgraded to partial clone on next reclone"))
+		} else {
+			results = append(results, PassedCheck(name, "partial clone"))
+		}
+	}
+
+	return results
 }
