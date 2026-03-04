@@ -21,6 +21,7 @@ import (
 	"github.com/sageox/ox/internal/gitserver"
 	"github.com/sageox/ox/internal/gitutil"
 	"github.com/sageox/ox/internal/lfs"
+	"github.com/sageox/ox/internal/paths"
 	"github.com/spf13/cobra"
 )
 
@@ -29,6 +30,7 @@ var importFlags struct {
 	text  string
 	date  string
 	force bool
+	team  string
 }
 
 var importCmd = &cobra.Command{
@@ -40,7 +42,11 @@ Documents are stored with LFS-backed content and git-tracked metadata.
 AI coworkers extract text before importing for indexing:
 
   ox import report.pdf --text extracted.md --title "Q1 Report"
-  ox import notes.md --date 2026-01-15`,
+  ox import notes.md --date 2026-01-15
+  ox import report.pdf --team my-team
+
+The team is auto-discovered from the current repo. Use --team to override
+or when working outside an initialized repo.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runImport,
 }
@@ -50,6 +56,7 @@ func init() {
 	importCmd.Flags().StringVar(&importFlags.text, "text", "", "path to pre-extracted text/markdown for indexing")
 	importCmd.Flags().StringVar(&importFlags.date, "date", "", "document date for filing (YYYY-MM-DD, default: file mtime)")
 	importCmd.Flags().BoolVar(&importFlags.force, "force", false, "re-import even if content hash already exists")
+	importCmd.Flags().StringVar(&importFlags.team, "team", "", "team ID (or slug/name when inside a repo)")
 }
 
 // docMeta is the metadata.json schema for imported documents.
@@ -104,14 +111,38 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	projectRoot, err := findProjectRoot()
-	if err != nil {
-		return fmt.Errorf("not in a SageOx project: %w", err)
-	}
+	// projectRoot is optional — import works outside a repo when --team is given
+	projectRoot, _ := findProjectRoot()
 
-	tc := config.FindRepoTeamContext(projectRoot)
-	if tc == nil {
-		return fmt.Errorf("no team context configured — run 'ox init' first")
+	// resolve endpoint once, used consistently for team resolution, LFS, and push
+	ep := resolveImportEndpoint(projectRoot)
+
+	var tc *config.TeamContext
+	if importFlags.team != "" {
+		if projectRoot != "" {
+			tc = resolveTeamContext(projectRoot, importFlags.team)
+		}
+		if tc == nil {
+			// no project root or team not found via project — scan by endpoint
+			tc = resolveTeamContextByEndpoint(importFlags.team, ep)
+		}
+		if tc == nil {
+			return fmt.Errorf("team context not found: %q (use ox agent prime to see available teams)", importFlags.team)
+		}
+	} else {
+		if projectRoot != "" {
+			tc = config.FindRepoTeamContext(projectRoot)
+		}
+		if tc == nil {
+			// no project or no team in project — try single-team auto-discovery
+			tc = autoDiscoverSingleTeam(ep)
+		}
+		if tc == nil {
+			if projectRoot == "" {
+				return fmt.Errorf("no team found — use --team to specify one, or run from inside a SageOx project")
+			}
+			return fmt.Errorf("no team context configured — use --team to specify one, or run 'ox init' first")
+		}
 	}
 
 	// data/ is excluded from the team context sparse checkout (deny list in
@@ -187,7 +218,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	}
 
 	// upload content to LFS
-	lfsClient, err := getTeamContextLFSClient(projectRoot, tc)
+	lfsClient, err := getTeamContextLFSClient(ep, tc)
 	if err != nil {
 		return fmt.Errorf("create LFS client: %w", err)
 	}
@@ -276,7 +307,6 @@ func runImport(cmd *cobra.Command, args []string) error {
 		slog.Warn("could not update .gitattributes", "error", err, "path", tc.Path)
 	}
 
-	ep := endpoint.GetForProject(projectRoot)
 	if err := commitAndPushDocImport(tc.Path, ep, dirSlug, metaPath, srcPointerPath, textPointerPath, hasText); err != nil {
 		return fmt.Errorf("commit and push: %w", err)
 	}
@@ -388,11 +418,69 @@ func detectContentType(filename string, content []byte) string {
 	return http.DetectContentType(content[:sniffLen])
 }
 
+// resolveImportEndpoint returns the SageOx endpoint, preferring project config when available.
+func resolveImportEndpoint(projectRoot string) string {
+	if projectRoot != "" {
+		if ep := endpoint.GetForProject(projectRoot); ep != "" {
+			return ep
+		}
+	}
+	return endpoint.Get()
+}
+
+// autoDiscoverSingleTeam returns the team context if exactly one team is synced
+// locally. Returns nil if zero or multiple teams are found.
+func autoDiscoverSingleTeam(ep string) *config.TeamContext {
+	if ep == "" {
+		return nil
+	}
+
+	teamsDir := paths.TeamsDataDir(ep)
+	entries, err := os.ReadDir(teamsDir)
+	if err != nil {
+		return nil
+	}
+
+	var dirs []os.DirEntry
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, e)
+		}
+	}
+	if len(dirs) != 1 {
+		return nil
+	}
+
+	return &config.TeamContext{
+		TeamID: dirs[0].Name(),
+		Path:   filepath.Join(teamsDir, dirs[0].Name()),
+	}
+}
+
+// resolveTeamContextByEndpoint finds a team context by team ID using only
+// the endpoint (no project root required). Scans the teams data directory.
+// Only matches by team ID since directory names are team IDs — slug/name
+// metadata is not available from the filesystem scan alone.
+func resolveTeamContextByEndpoint(query, ep string) *config.TeamContext {
+	if ep == "" {
+		return nil
+	}
+
+	teamsDir := paths.TeamsDataDir(ep)
+	teamPath := filepath.Join(teamsDir, query)
+	if info, err := os.Stat(teamPath); err == nil && info.IsDir() {
+		return &config.TeamContext{
+			TeamID: query,
+			Path:   teamPath,
+		}
+	}
+
+	return nil
+}
+
 // getTeamContextLFSClient creates an LFS client for the team context repo.
 // Fallback chain: cloud API → cached marker → git remote URL.
-func getTeamContextLFSClient(projectRoot string, tc *config.TeamContext) (*lfs.Client, error) {
-	ep := endpoint.GetForProject(projectRoot)
-
+func getTeamContextLFSClient(ep string, tc *config.TeamContext) (*lfs.Client, error) {
 	creds, err := gitserver.LoadCredentialsForEndpoint(ep)
 	if err != nil {
 		return nil, fmt.Errorf("load credentials: %w", err)
@@ -404,8 +492,7 @@ func getTeamContextLFSClient(projectRoot string, tc *config.TeamContext) (*lfs.C
 		return nil, fmt.Errorf("git credentials have empty token")
 	}
 
-	sageoxDir := filepath.Join(projectRoot, ".sageox")
-	repoURL := GetTeamURLWithFallback(sageoxDir, tc.TeamID, ep)
+	repoURL := GetTeamURLWithFallback("", tc.TeamID, ep)
 	if repoURL == "" {
 		// last resort: read from local git remote
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
