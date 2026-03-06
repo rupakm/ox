@@ -4,15 +4,20 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
 )
+
+// ErrInstanceNotFound is returned when an operation targets an agent ID that doesn't exist in the store.
+var ErrInstanceNotFound = errors.New("instance not found")
 
 // Design decision: JSONL storage format
 // Rationale: Append-only enables concurrent writes; scan newest-first for O(recent) lookups;
@@ -52,6 +57,14 @@ type Instance struct {
 	AgentType string `json:"agent_type,omitempty"` // claude-code, droid, cursor, windsurf
 	AgentVer  string `json:"agent_ver,omitempty"`  // Agent version (e.g., "1.0.42")
 	Model     string `json:"model,omitempty"`      // Model used (e.g., "claude-opus-4-5")
+	// Process tracking — PPID is the parent agent process (e.g., Claude Code).
+	// Captured at prime time via os.Getppid(). Used by "ox agent list" to
+	// check liveness with kill(pid, 0) without needing the daemon.
+	ParentPID int `json:"parent_pid,omitempty"`
+	// Agent hierarchy — detected at prime time by reading SAGEOX_AGENT_ID env var.
+	// If already set when a new agent primes, the existing value is the parent
+	// (orchestrator inherits env vars to subagents).
+	ParentAgentID string `json:"parent_agent_id,omitempty"`
 	// Usage tracking
 	PrimeCallCount int `json:"prime_call_count,omitempty"` // number of times prime was called
 }
@@ -59,6 +72,21 @@ type Instance struct {
 // IsExpired checks if the instance has expired
 func (i *Instance) IsExpired() bool {
 	return time.Now().After(i.ExpiresAt)
+}
+
+// IsProcessAlive checks if the parent agent process is still running.
+// Uses kill(pid, 0) which checks existence without sending a signal.
+// Returns false if no PID was recorded or the process is gone.
+func (i *Instance) IsProcessAlive() bool {
+	if i.ParentPID <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(i.ParentPID)
+	if err != nil {
+		return false
+	}
+	// signal 0: test if process exists without actually signaling it
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 // IsPrimeExcessive returns true if prime has been called more than the threshold.
@@ -247,7 +275,7 @@ func (s *Store) IncrementPrimeCallCount(agentID string) (*Instance, bool, error)
 	}
 
 	if updatedInst == nil {
-		return nil, false, fmt.Errorf("instance not found for agent_id: %s", agentID)
+		return nil, false, fmt.Errorf("%w: %s", ErrInstanceNotFound, agentID)
 	}
 
 	if err := s.rewriteInstances(instances); err != nil {
@@ -365,7 +393,8 @@ func (s *Store) readInstances() ([]*Instance, int, int, error) {
 	return s.readInstancesNoLock()
 }
 
-// readInstancesNoLock reads instances without acquiring the mutex (caller must hold lock)
+// readInstancesNoLock reads instances without acquiring the mutex (caller must hold lock).
+// Deduplicates by AgentID, keeping the latest entry (last-write-wins in append-only JSONL).
 func (s *Store) readInstancesNoLock() ([]*Instance, int, int, error) {
 	f, err := os.Open(s.instancesPath)
 	if err != nil {
@@ -376,7 +405,9 @@ func (s *Store) readInstancesNoLock() ([]*Instance, int, int, error) {
 	}
 	defer f.Close()
 
-	var instances []*Instance
+	// last-write-wins: later lines in the JSONL override earlier ones for the same AgentID
+	seen := make(map[string]*Instance)
+	var order []string // preserve insertion order
 	var totalCount int
 	now := time.Now()
 
@@ -385,17 +416,26 @@ func (s *Store) readInstancesNoLock() ([]*Instance, int, int, error) {
 		totalCount++
 		var inst Instance
 		if err := json.Unmarshal(scanner.Bytes(), &inst); err != nil {
-			// skip invalid lines but continue reading
 			continue
 		}
 
-		if !now.After(inst.ExpiresAt) {
-			instances = append(instances, &inst)
+		if now.After(inst.ExpiresAt) {
+			continue
 		}
+
+		if _, exists := seen[inst.AgentID]; !exists {
+			order = append(order, inst.AgentID)
+		}
+		seen[inst.AgentID] = &inst
 	}
 
 	if err := scanner.Err(); err != nil {
 		return nil, 0, 0, fmt.Errorf("failed to read instances: %w", err)
+	}
+
+	instances := make([]*Instance, 0, len(order))
+	for _, id := range order {
+		instances = append(instances, seen[id])
 	}
 
 	expiredCount := totalCount - len(instances)

@@ -4,14 +4,32 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"time"
 
 	"github.com/sageox/ox/internal/agentinstance"
 	"github.com/sageox/ox/internal/auth"
+	"github.com/sageox/ox/internal/cli"
 	"github.com/sageox/ox/internal/config"
 	"github.com/sageox/ox/internal/daemon"
 	"github.com/sageox/ox/internal/repotools"
+	"github.com/sageox/ox/internal/session"
 	"github.com/spf13/cobra"
 )
+
+// contextBytesProduced accumulates the number of context bytes written by the
+// current ox agent subcommand. Reset at the start of runWithAgentID and read
+// in a deferred heartbeat after the command completes. Best-effort tracking.
+// Bytes are converted to estimated tokens at the heartbeat boundary (sendContextHeartbeat).
+var contextBytesProduced atomic.Int64
+
+// trackContextBytes adds n bytes to the current command's context byte counter.
+// Called by agent subcommands after producing output (e.g., JSON responses).
+// Conversion to tokens happens later in sendContextHeartbeat, not here,
+// so callers pass the natural measurement (bytes written).
+func trackContextBytes(n int64) {
+	contextBytesProduced.Add(n)
+}
 
 // SageOx is multiplayer - offline API mode is not supported.
 // See internal/auth/feature.go for the multiplayer philosophy.
@@ -193,6 +211,14 @@ func runWithAgentID(cmd *cobra.Command, agentID string, args []string) error {
 	}
 
 	subcommand := args[0]
+
+	// reset context byte counter; deferred heartbeat sends accumulated bytes
+	contextBytesProduced.Store(0)
+	defer func() {
+		if bytes := contextBytesProduced.Load(); bytes > 0 {
+			sendContextHeartbeat(agentID, bytes, subcommand)
+		}
+	}()
 	subargs := args[1:]
 
 	switch subcommand {
@@ -319,7 +345,7 @@ func getInstanceStore(projectRoot string) (*agentinstance.Store, error) {
 	return agentinstance.NewStoreForUser(projectRoot, getUserSlug())
 }
 
-// runAgentList lists active agent instances (debug only)
+// runAgentList lists active AI coworkers with context consumption and session info.
 func runAgentList(cmd *cobra.Command, args []string) error {
 	projectRoot, err := findProjectRoot()
 	if err != nil {
@@ -337,28 +363,150 @@ func runAgentList(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(instances) == 0 {
-		fmt.Println("No active agent instances.")
-		fmt.Println("\nRun 'ox agent prime' to create a new instance.")
+		fmt.Println("No active AI coworkers.")
+		fmt.Println("\nRun 'ox agent prime' to start one.")
 		return nil
 	}
 
-	fmt.Printf("Active agent instances (%d):\n\n", len(instances))
-	fmt.Printf("%-8s %-12s %-10s %s\n", "ID", "Agent", "Model", "Created")
-	fmt.Println("──────── ──────────── ────────── ────────────────────")
+	// build lookup of daemon context stats by agent ID
+	daemonStats := make(map[string]daemon.InstanceInfo)
+	if client := daemon.TryConnect(); client != nil {
+		if daemonInstances, err := client.Instances(); err == nil {
+			for _, di := range daemonInstances {
+				daemonStats[di.AgentID] = di
+			}
+		}
+	}
+
+	dim := cli.StyleDim
+	green := cli.StyleSuccess
+
+	// filter to agents whose parent process is still running.
+	// PID check is definitive (kill -0); falls back to daemon/recording heuristics
+	// for instances created before PID tracking was added.
+	var alive []*agentinstance.Instance
 	for _, inst := range instances {
+		if inst.IsProcessAlive() {
+			alive = append(alive, inst)
+			continue
+		}
+		// fallback for pre-PID instances: daemon knows about them or actively recording
+		if inst.ParentPID == 0 {
+			_, knownToDaemon := daemonStats[inst.AgentID]
+			if knownToDaemon || session.IsRecordingForAgent(projectRoot, inst.AgentID) {
+				alive = append(alive, inst)
+			}
+		}
+	}
+
+	if len(alive) == 0 {
+		fmt.Println("No active AI coworkers.")
+		fmt.Println("\nRun 'ox agent prime' to start one.")
+		return nil
+	}
+
+	// check if workspaces are heterogeneous — only show column when useful
+	workspaces := make(map[string]bool)
+	for _, inst := range alive {
+		ws := filepath.Base(projectRoot)
+		if ds, ok := daemonStats[inst.AgentID]; ok && ds.WorkspacePath != "" {
+			ws = filepath.Base(ds.WorkspacePath)
+		}
+		workspaces[ws] = true
+	}
+	showWorkspace := len(workspaces) > 1
+
+	// build agent hierarchy — group subagents under their parent
+	aliveSet := make(map[string]*agentinstance.Instance)
+	children := make(map[string][]string) // parentID -> child IDs
+	var roots []string                    // agents with no parent (or parent not alive)
+	for _, inst := range alive {
+		aliveSet[inst.AgentID] = inst
+	}
+	for _, inst := range alive {
+		if inst.ParentAgentID != "" {
+			if _, parentAlive := aliveSet[inst.ParentAgentID]; parentAlive {
+				children[inst.ParentAgentID] = append(children[inst.ParentAgentID], inst.AgentID)
+				continue
+			}
+		}
+		roots = append(roots, inst.AgentID)
+	}
+
+	fmt.Printf("Active AI coworkers (%d):\n\n", len(alive))
+	// dim headers — minimize non-data ink (Tufte)
+	header := fmt.Sprintf("  %s  %s  %s  %s  %s  %s",
+		dim.Render(fmt.Sprintf("%-8s", "ID")),
+		dim.Render(fmt.Sprintf("%-10s", "Type")),
+		dim.Render(fmt.Sprintf("%8s", "Tokens")),
+		dim.Render(fmt.Sprintf("%5s", "Cmds")),
+		dim.Render(fmt.Sprintf("%7s", "Uptime")),
+		dim.Render(fmt.Sprintf("%-3s", "Rec")),
+	)
+	if showWorkspace {
+		header += "  " + dim.Render(fmt.Sprintf("%-20s", "Workspace"))
+	}
+	fmt.Println(header)
+
+	// renderRow prints one agent row with optional tree prefix
+	renderRow := func(inst *agentinstance.Instance, prefix string) {
 		agentType := inst.AgentType
 		if agentType == "" {
 			agentType = "-"
 		}
-		model := inst.Model
-		if model == "" {
-			model = "-"
+
+		// token count from daemon (already estimated at source)
+		tokens := fmt.Sprintf("%8s", "-")
+		cmds := fmt.Sprintf("%5s", "-")
+		if ds, ok := daemonStats[inst.AgentID]; ok && ds.CumulativeContextTokens > 0 {
+			tokens = fmt.Sprintf("%8s", "~"+formatTokenCount(int(ds.CumulativeContextTokens)))
+			cmds = fmt.Sprintf("%5d", ds.CommandCount)
 		}
-		fmt.Printf("%-8s %-12s %-10s %s\n",
-			inst.AgentID,
+
+		// session uptime
+		uptime := fmt.Sprintf("%7s", formatDurationShort(time.Since(inst.CreatedAt)))
+
+		// recording status
+		rec := dim.Render(fmt.Sprintf("%-3s", "-"))
+		if session.IsRecordingForAgent(projectRoot, inst.AgentID) {
+			rec = green.Render(fmt.Sprintf("%-3s", "rec"))
+		}
+
+		// ID column: tree prefix (dim) + agent ID (gold)
+		idCol := dim.Render(prefix) + cli.StyleSecondary.Render(inst.AgentID)
+		// pad to account for prefix width: 2 (indent) + 8 (id field)
+		padded := fmt.Sprintf("%-8s", prefix+inst.AgentID)
+		_ = padded // use visual width from styled rendering
+		idWidth := len(prefix) + len(inst.AgentID)
+		idPad := ""
+		if idWidth < 8 {
+			idPad = fmt.Sprintf("%*s", 8-idWidth, "")
+		}
+
+		row := fmt.Sprintf("  %s%s  %-10s  %s  %s  %s  %s",
+			idCol, idPad,
 			agentType,
-			model,
-			inst.CreatedAt.Format("2006-01-02 15:04"))
+			dim.Render(tokens),
+			dim.Render(cmds),
+			dim.Render(uptime),
+			rec,
+		)
+		if showWorkspace {
+			workspace := filepath.Base(projectRoot)
+			if ds, ok := daemonStats[inst.AgentID]; ok && ds.WorkspacePath != "" {
+				workspace = filepath.Base(ds.WorkspacePath)
+			}
+			row += "  " + dim.Render(fmt.Sprintf("%-20s", workspace))
+		}
+		fmt.Println(row)
+	}
+
+	// render tree: roots first, then their children indented
+	for _, rootID := range roots {
+		renderRow(aliveSet[rootID], "")
+		for _, childID := range children[rootID] {
+			renderRow(aliveSet[childID], " \u2514")
+		}
 	}
 
 	return nil

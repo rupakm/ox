@@ -277,6 +277,9 @@ type agentPrimeOutput struct {
 	// Prime call tracking
 	PrimeCallCount       int    `json:"prime_call_count,omitempty"`       // number of prime calls this session
 	PrimeExcessiveNotice string `json:"prime_excessive_notice,omitempty"` // warning if prime called excessively
+	// Cumulative context stats (from daemon, best-effort)
+	CumulativeContextTokens int64 `json:"cumulative_context_tokens,omitempty"` // estimated total tokens produced by ox commands
+	CommandCount            int   `json:"command_count,omitempty"`             // number of ox commands that produced context
 	// Doctor agent marker
 	NeedsDoctorAgent bool   `json:"needs_doctor_agent,omitempty"` // true if .needs-doctor-agent marker exists
 	DoctorHint       string `json:"doctor_hint,omitempty"`        // hint for agent to run ox agent doctor
@@ -568,22 +571,51 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(cmd.OutOrStdout())
 	}
 
-	// register agent instance locally (bootstrap completes without cloud API)
-	serverSessionID := auth.NewServerSessionID()
+	// register or update agent instance locally (bootstrap completes without cloud API)
+	var inst *agentinstance.Instance
+	var primeCallCount int
 
-	inst := &agentinstance.Instance{
-		AgentID:         agentID,
-		ServerSessionID: serverSessionID,
-		CreatedAt:       time.Now(),
-		ExpiresAt:       time.Now().Add(24 * time.Hour),
-		AgentType:       agentType,
-		AgentVer:        agentVer,
-		Model:           model,
-		PrimeCallCount:  1,
+	if existingMarker != nil && existingMarker.AgentID != "" {
+		// re-prime: increment existing instance's prime call count.
+		// Only fall through to fresh-prime on "not found"; real errors (lock, I/O) are returned.
+		updated, isExcessive, err := store.IncrementPrimeCallCount(agentID)
+		if err == nil {
+			inst = updated
+			primeCallCount = updated.PrimeCallCount
+			if isExcessive {
+				trackPrimeExcessive(updated)
+			}
+		} else if !errors.Is(err, agentinstance.ErrInstanceNotFound) {
+			return fmt.Errorf("failed to update instance: %w", err)
+		}
 	}
 
-	if err := store.Add(inst); err != nil {
-		return fmt.Errorf("failed to store instance: %w", err)
+	// detect parent agent: if SAGEOX_AGENT_ID is already set, this is a subagent
+	// and the existing value identifies the parent (orchestrator inherits env vars)
+	parentAgentID := ""
+	if existing := os.Getenv("SAGEOX_AGENT_ID"); existing != "" && existing != agentID {
+		parentAgentID = existing
+	}
+
+	if inst == nil {
+		// fresh prime (or re-prime where instance wasn't found): create new
+		serverSessionID := auth.NewServerSessionID()
+		inst = &agentinstance.Instance{
+			AgentID:         agentID,
+			ServerSessionID: serverSessionID,
+			CreatedAt:       time.Now(),
+			ExpiresAt:       time.Now().Add(24 * time.Hour),
+			AgentType:       agentType,
+			AgentVer:        agentVer,
+			Model:           model,
+			ParentPID:       os.Getppid(),
+			ParentAgentID:   parentAgentID,
+			PrimeCallCount:  1,
+		}
+		if err := store.Add(inst); err != nil {
+			return fmt.Errorf("failed to store instance: %w", err)
+		}
+		primeCallCount = 1
 	}
 	trackInstanceStart(inst)
 
@@ -593,7 +625,7 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 		Status:           "fresh",
 		AgentID:          agentID,
 		Guidance:         guidance,
-		SessionID:        serverSessionID,
+		SessionID:        inst.ServerSessionID,
 		AgentType:        agentType,
 		AgentSupported:   isAgentSupported(agentType),
 		SupportNotice:    getAgentSupportNotice(agentType),
@@ -608,10 +640,33 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 		Session:          sessionStat,
 		Ledger:           ledgerStatus,
 		TeamContext:      teamCtx,
-		PrimeCallCount:   1,
+		PrimeCallCount:   primeCallCount,
 		NeedsDoctorAgent: needsDoctorAgent,
 		DoctorHint:       doctorHint,
 		HooksInstalled:   hooksInstalled,
+	}
+
+	// populate cumulative context stats from daemon (best-effort).
+	// read BEFORE sending this command's heartbeat — intentional: these report
+	// "consumed so far", not including the prime output about to be emitted.
+	// heartbeats are async fire-and-forget, so ordering wouldn't be guaranteed anyway.
+	if daemonClient := daemon.TryConnect(); daemonClient != nil {
+		if instances, err := daemonClient.Instances(); err == nil {
+			for _, di := range instances {
+				if di.AgentID == agentID {
+					output.CumulativeContextTokens = di.CumulativeContextTokens
+					output.CommandCount = di.CommandCount
+					break
+				}
+			}
+		}
+	}
+
+	// populate excessive prime notice if applicable
+	if inst.IsPrimeExcessive() {
+		output.PrimeExcessiveNotice = fmt.Sprintf(
+			"Prime called %d times (threshold: %d). This may indicate context compaction issues or agent misconfiguration. Each prime injects ~%d bytes into your context window.",
+			primeCallCount, agentinstance.ExcessivePrimeThreshold, output.ContentLength)
 	}
 
 	// populate session URL if recording
@@ -724,7 +779,7 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 
 		marker := &SessionMarker{
 			AgentID:        agentID,
-			SessionID:      serverSessionID,
+			SessionID:      inst.ServerSessionID,
 			AgentSessionID: agentSessionID,
 			PrimedAt:       time.Now(),
 			LastNotified:   newLastNotified,
@@ -735,7 +790,7 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 
 		envVars := map[string]string{
 			"SAGEOX_AGENT_ID":   agentID,
-			"SAGEOX_SESSION_ID": serverSessionID,
+			"SAGEOX_SESSION_ID": inst.ServerSessionID,
 		}
 		if agentType != "" {
 			envVars["AGENT_ENV"] = agentType
@@ -1075,9 +1130,18 @@ func outputAgentPrime(cmd *cobra.Command, textMode, reviewMode bool, output agen
 
 	// default: JSON output for agent consumption
 	// This is the primary use case - agents consume JSON directly without parsing overhead
-	encoder := json.NewEncoder(cmd.OutOrStdout())
+	cw := agentinstance.NewCountingWriter(cmd.OutOrStdout())
+	encoder := json.NewEncoder(cw)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(output)
+	if err := encoder.Encode(output); err != nil {
+		return err
+	}
+
+	// prime is not dispatched via runWithAgentID, send heartbeat directly
+	if bytes := cw.BytesWritten(); bytes > 0 && output.AgentID != "" {
+		sendContextHeartbeat(output.AgentID, bytes, "prime")
+	}
+	return nil
 }
 
 // buildHumanSummary creates a human-readable summary for --review mode
